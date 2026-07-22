@@ -4,16 +4,18 @@ Tool naming convention: <vendor>_<action>_<resource>
 """
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from mcp.server.fastmcp import FastMCP
 
 from ..api_client import PassportalClient, PassportalError
+from ..auth import PassportalAuthError
 
 _NO_TOKEN = (
-    "Error: No Passportal credentials configured. Set PASSPORTAL_API_TOKEN + "
-    "PASSPORTAL_BASE_URL, or use AUTH_MODE=gateway and pass the x-api-token and "
-    "x-passportal-base-url headers per request."
+    "Error: No Passportal credentials configured. Set PASSPORTAL_ACCESS_KEY + "
+    "PASSPORTAL_SECRET_KEY + PASSPORTAL_BASE_URL, or use AUTH_MODE=gateway and pass the "
+    "x-passportal-access-key, x-passportal-secret-key, and x-passportal-base-url headers "
+    "per request."
 )
 
 # Valid values for the `type` (template type) filter, per Passportal API v2.
@@ -24,7 +26,10 @@ _DOCUMENT_TYPES = (
 )
 
 
-def register(mcp: FastMCP, client_factory: Callable[[], PassportalClient | None]) -> None:
+ClientFactory = Callable[[], Awaitable[PassportalClient | None]]
+
+
+def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
     @mcp.tool()
     async def passportal_list_documents(
         resultsPerPage: int | None = None,
@@ -52,10 +57,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], PassportalClient | None]
             clientId: Client identifier filter.
             searchTxt: Free-text search across document attributes.
         """
-        client = client_factory()
-        if client is None:
-            return _NO_TOKEN
         try:
+            client = await client_factory()
+            if client is None:
+                return _NO_TOKEN
             result = await client.get(
                 "/api/v2/documents",
                 params={
@@ -70,5 +75,5 @@ def register(mcp: FastMCP, client_factory: Callable[[], PassportalClient | None]
                 },
             )
             return json.dumps(result, indent=2)
-        except PassportalError as e:
+        except (PassportalError, PassportalAuthError) as e:
             return f"Error: {e}"

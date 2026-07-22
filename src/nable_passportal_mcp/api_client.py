@@ -2,7 +2,10 @@ from typing import Any
 
 import httpx
 
-DEFAULT_AUTH_HEADER = "x-api-token"
+# Fixed by Passportal's own API contract (not user-configurable, unlike the
+# gateway-mode credential headers this container itself exposes): the bearer
+# access token obtained via auth.get_access_token is sent as x-access-token.
+ACCESS_TOKEN_HEADER = "x-access-token"
 
 
 class PassportalError(Exception):
@@ -14,25 +17,21 @@ class PassportalError(Exception):
 class PassportalClient:
     """Async httpx client wrapping the N-able Passportal REST API (v2).
 
-    Authentication uses the ``x-api-token`` header. The base URL is the
-    customer instance root (e.g. ``https://instance.passportalmsp.com``); the
-    ``/api/v2`` version prefix is included in the paths passed to the request
-    methods.
+    Authentication uses the ``x-access-token`` header, carrying a short-lived
+    access token obtained via the HMAC client-credentials exchange in
+    ``auth.py`` (never the long-lived Access Key / Secret Access Key). The
+    base URL is the customer instance root (e.g.
+    ``https://instance.passportalmsp.com``); the ``/api/v2`` version prefix is
+    included in the paths passed to the request methods.
     """
 
-    def __init__(
-        self,
-        api_token: str,
-        base_url: str,
-        auth_header: str = DEFAULT_AUTH_HEADER,
-    ):
-        self._token = api_token
+    def __init__(self, access_token: str, base_url: str):
+        self._token = access_token
         self._base_url = base_url.rstrip("/")
-        self._auth_header = auth_header
 
     def _headers(self) -> dict[str, str]:
         return {
-            self._auth_header: self._token,
+            ACCESS_TOKEN_HEADER: self._token,
             "Content-Type": "application/json",
         }
 

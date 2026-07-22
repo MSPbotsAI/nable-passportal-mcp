@@ -4,14 +4,16 @@ A stateless HTTP **MCP service** for the [N-able Passportal](https://documentati
 
 ## 服务介绍
 
-- **Stateless** — 不保存任何用户状态、凭据或会话数据，请求之间完全隔离。
-- **Concurrent-safe** — 每请求的 token 与实例 base URL 通过 Python `contextvars` 隔离，并发请求之间绝不串号。
-- **多租户** — 每个请求自带 Passportal API token 与客户实例 base URL（gateway 模式），单个服务实例即可服务多个 Passportal 客户。
-- **认证** — 通过 HTTP Header `x-api-token` 传入 Passportal API token；通过 `x-passportal-base-url` 传入客户实例地址。
+- **Stateless** — 不保存任何用户状态或会话数据，请求之间完全隔离；仅在进程内缓存派生出的短期 access token（见下文"认证"）。
+- **Concurrent-safe** — 每请求的凭据与实例 base URL 通过 Python `contextvars` 隔离，并发请求之间绝不串号。
+- **多租户** — 每个请求自带 Passportal Access Key / Secret Access Key 与客户实例 base URL（gateway 模式），单个服务实例即可服务多个 Passportal 客户。
+- **认证** — Passportal 用的是 OAuth2 client-credentials、HMAC 签名的授权方式：本服务用长期的 Access Key / Secret Access Key 对，自己向 Passportal 换取短期（约 55 分钟）access token 并按租户缓存，调用方无需关心 HMAC 计算或 token 续期。凭据通过 `x-passportal-access-key` / `x-passportal-secret-key` 两个 Header 传入，`x-passportal-base-url` 传入客户实例地址。
 
 上游 API 参考：
 - API 概览：https://documentation.n-able.com/passportal/userguide/Content/api/api_information.htm
 - List Documents：https://documentation.n-able.com/passportal/userguide/Content/api/api_list_documents.htm
+- 授权流程：https://documentation.n-able.com/passportal/userguide/Content/api/api_authorization.htm
+- HMAC Token 生成：https://documentation.n-able.com/passportal/userguide/Content/api/api_create_hmac.htm
 
 ## Endpoints
 
@@ -26,16 +28,27 @@ A stateless HTTP **MCP service** for the [N-able Passportal](https://documentati
 
 Gateway 模式（默认、生产、SOP 合规）下，每个 `/mcp` 请求必须携带以下 Header：
 
-### `x-api-token`
+### `x-passportal-access-key`
 
-| 项目     | 说明                                             |
-|----------|--------------------------------------------------|
-| 类型     | string                                           |
-| 是否必填 | 必填                                             |
-| 默认值   | 无                                               |
-| 枚举值   | 无                                               |
-| 字段描述 | Passportal API access token，用于调用方身份认证。 |
-| Example  | `x-api-token: eyJhbGciOi...`                     |
+| 项目     | 说明                                                                        |
+|----------|-----------------------------------------------------------------------------|
+| 类型     | string                                                                      |
+| 是否必填 | 必填                                                                        |
+| 默认值   | 无                                                                          |
+| 枚举值   | 无                                                                          |
+| 字段描述 | Passportal Access Key（对应授权请求里的 `x-key`），在 Passportal 门户生成。 |
+| Example  | `x-passportal-access-key: 11111111111111111111111111111111`                |
+
+### `x-passportal-secret-key`
+
+| 项目     | 说明                                                                                                                   |
+|----------|-------------------------------------------------------------------------------------------------------------------------|
+| 类型     | string                                                                                                                  |
+| 是否必填 | 必填                                                                                                                    |
+| 默认值   | 无                                                                                                                     |
+| 枚举值   | 无                                                                                                                     |
+| 字段描述 | Passportal Secret Access Key。本服务在进程内用它对每次 token 交换请求做 HMAC-SHA256 签名（`x-hash`），从不持久化、不转发给 Passportal 之外的任何地方。 |
+| Example  | `x-passportal-secret-key: 22222222222222222222222222222222`                                                            |
 
 ### `x-passportal-base-url`
 
@@ -48,7 +61,18 @@ Gateway 模式（默认、生产、SOP 合规）下，每个 `/mcp` 请求必须
 | 字段描述 | 客户 Passportal 实例的 Base URL（dashboard 地址的根，不含尾部 `/`）。例如 dashboard 为 `https://instance.passportalmsp.com//dashboard#/default`，则此处填 `https://instance.passportalmsp.com`。 |
 | Example  | `x-passportal-base-url: https://instance.passportalmsp.com`                              |
 
-> 缺少任一 Header 时，`/mcp` 请求返回 `401`，响应体的 `required_headers` 会列出所需的两个 Header 名。
+> 缺少任一 Header 时，`/mcp` 请求返回 `401`，响应体的 `required_headers` 会列出所需的三个 Header 名。
+
+### 内部授权流程（自动完成，调用方无需关心）
+
+本服务收到上述三个 Header 后，在真正调用 Documents API 之前，会自动：
+
+1. 生成一段随机明文 `content`，用 `Secret Access Key` 对其计算 `HMAC-SHA256` 签名得到 `x-hash`（hex 编码）。
+2. `POST {base_url}/api/v2/auth/client_token`，Header 带 `x-key`(=Access Key)、`x-hash`，body 带 `{ "scope": "docs_api", "content": "<同一段明文>" }`，换回 `access_token` 与过期时间 `expiry_time`。
+3. 用换到的 `access_token` 作为 `x-access-token` Header 调用真正的 Documents API（如 `GET /api/v2/documents`）。
+4. 按 `(base_url, access_key, secret_key)` 的指纹在进程内缓存该 `access_token`，直到临近 `expiry_time`（默认无返回时按 55 分钟兜底）才重新走一次上述交换——避免每次工具调用都重新签名换 token。
+
+调用方全程只需要提供 Access Key / Secret Access Key / base URL 这三项静态凭据，HMAC 计算、token 交换与续期均由本服务完成。
 
 ## Tool List
 
@@ -92,18 +116,21 @@ List documents from N-able Passportal —`GET <base_url>/api/v2/documents`。全
 
 ## Configuration
 
-| Variable                     | Required      | Default                 | Description                                                                    |
-|------------------------------|---------------|-------------------------|--------------------------------------------------------------------------------|
-| `AUTH_MODE`                  | No            | `gateway`               | `gateway`（每请求 Header，SOP 合规）或 `env`（共享凭据，仅本地开发）。          |
-| `PASSPORTAL_AUTH_HEADER`     | No            | `x-api-token`           | gateway 模式下携带 token 的 Header 名。                                         |
-| `PASSPORTAL_BASE_URL_HEADER` | No            | `x-passportal-base-url` | gateway 模式下携带实例 base URL 的 Header 名。                                  |
-| `PASSPORTAL_API_TOKEN`       | env mode only | —                       | env 模式下使用的 Passportal API token。                                        |
-| `PASSPORTAL_BASE_URL`        | env mode only | —                       | env 模式下的客户实例 base URL，如 `https://instance.passportalmsp.com`。        |
-| `MCP_TRANSPORT`              | No            | `http`                  | 传输方式：`http` 或 `stdio`。                                                   |
-| `MCP_HTTP_PORT`              | No            | `8080`                  | HTTP 监听端口。                                                                |
-| `MCP_HTTP_HOST`              | No            | `0.0.0.0`               | HTTP 监听地址。                                                                |
+| Variable                       | Required      | Default                    | Description                                                                    |
+|---------------------------------|---------------|-----------------------------|--------------------------------------------------------------------------------|
+| `AUTH_MODE`                     | No            | `gateway`                  | `gateway`（每请求 Header，SOP 合规）或 `env`（共享凭据，仅本地开发）。          |
+| `PASSPORTAL_ACCESS_KEY_HEADER`   | No            | `x-passportal-access-key`  | gateway 模式下携带 Access Key 的 Header 名。                                    |
+| `PASSPORTAL_SECRET_KEY_HEADER`   | No            | `x-passportal-secret-key`  | gateway 模式下携带 Secret Access Key 的 Header 名。                             |
+| `PASSPORTAL_BASE_URL_HEADER`     | No            | `x-passportal-base-url`    | gateway 模式下携带实例 base URL 的 Header 名。                                  |
+| `PASSPORTAL_TOKEN_SCOPE`         | No            | `docs_api`                 | token 交换请求的 `scope`，由 Passportal Documents API 固定，一般无需修改。      |
+| `PASSPORTAL_ACCESS_KEY`          | env mode only | —                          | env 模式下使用的 Passportal Access Key。                                       |
+| `PASSPORTAL_SECRET_KEY`          | env mode only | —                          | env 模式下使用的 Passportal Secret Access Key。                                |
+| `PASSPORTAL_BASE_URL`            | env mode only | —                          | env 模式下的客户实例 base URL，如 `https://instance.passportalmsp.com`。        |
+| `MCP_TRANSPORT`                 | No            | `http`                     | 传输方式：`http` 或 `stdio`。                                                   |
+| `MCP_HTTP_PORT`                  | No            | `8080`                     | HTTP 监听端口。                                                                |
+| `MCP_HTTP_HOST`                  | No            | `0.0.0.0`                  | HTTP 监听地址。                                                                |
 
-**`env` 模式**（仅本地开发，**非生产 SOP 合规**）：设置 `AUTH_MODE=env`、`PASSPORTAL_API_TOKEN`、`PASSPORTAL_BASE_URL`，所有请求共享同一凭据，切勿用于生产 / 多租户。
+**`env` 模式**（仅本地开发，**非生产 SOP 合规**）：设置 `AUTH_MODE=env`、`PASSPORTAL_ACCESS_KEY`、`PASSPORTAL_SECRET_KEY`、`PASSPORTAL_BASE_URL`，所有请求共享同一凭据，切勿用于生产 / 多租户。
 
 ## Quick Start
 
@@ -112,14 +139,16 @@ List documents from N-able Passportal —`GET <base_url>/api/v2/documents`。全
 ```bash
 uv sync
 uv run nable-passportal-mcp
-# 每请求通过 x-api-token + x-passportal-base-url Header 传入凭据与实例地址
+# 每请求通过 x-passportal-access-key + x-passportal-secret-key + x-passportal-base-url
+# Header 传入凭据与实例地址；本服务内部自动完成 HMAC 签名与 token 交换/续期
 ```
 
 ### HTTP server (env mode — 仅本地开发)
 
 ```bash
 cp .env.example .env
-# 编辑 .env：AUTH_MODE=env、PASSPORTAL_API_TOKEN=...、PASSPORTAL_BASE_URL=https://<instance>.passportalmsp.com
+# 编辑 .env：AUTH_MODE=env、PASSPORTAL_ACCESS_KEY=...、PASSPORTAL_SECRET_KEY=...、
+#           PASSPORTAL_BASE_URL=https://<instance>.passportalmsp.com
 uv sync
 uv run nable-passportal-mcp
 # 服务启动于 http://0.0.0.0:8080
@@ -151,7 +180,8 @@ curl http://localhost:8080/health
 curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -H "x-api-token: your_token_here" \
+  -H "x-passportal-access-key: your_access_key" \
+  -H "x-passportal-secret-key: your_secret_access_key" \
   -H "x-passportal-base-url: https://instance.passportalmsp.com" \
   -d '{
     "jsonrpc": "2.0",
@@ -171,7 +201,8 @@ curl -X POST http://localhost:8080/mcp \
 curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -H "x-api-token: your_token_here" \
+  -H "x-passportal-access-key: your_access_key" \
+  -H "x-passportal-secret-key: your_secret_access_key" \
   -H "x-passportal-base-url: https://instance.passportalmsp.com" \
   -d '{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}'
 ```
@@ -182,7 +213,8 @@ curl -X POST http://localhost:8080/mcp \
 curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -H "x-api-token: your_token_here" \
+  -H "x-passportal-access-key: your_access_key" \
+  -H "x-passportal-secret-key: your_secret_access_key" \
   -H "x-passportal-base-url: https://instance.passportalmsp.com" \
   -d '{
     "jsonrpc": "2.0",
@@ -201,9 +233,12 @@ curl -X POST http://localhost:8080/mcp \
   }'
 ```
 
+第一次调用会先触发一次内部 HMAC token 交换（略增延迟），后续约 55 分钟内的调用复用缓存的 access token。
+
 ## Security
 
-- 凭据与实例地址不会全局保存，也不会在请求之间持久化。
-- 每请求的 token / base URL 存放于 `contextvars.ContextVar`，请求结束后立即 reset。
+- 每请求的 Access Key / Secret Access Key / base URL 存放于 `contextvars.ContextVar`，请求结束后立即 reset，绝不跨租户串号。
+- 换来的短期 access token（约 55 分钟有效期）按 `(base_url, access_key, secret_key)` 指纹在进程内缓存，纯为避免每次工具调用都重新做一次 HMAC 签名 + 网络往返；缓存只存派生出的短期 token，不存 Secret Access Key 本身，也不落盘、不跨进程持久化。
+- Secret Access Key 只在进程内用于计算 `x-hash`（`auth.py::compute_x_hash`），从不被记录到日志，也不会转发给 Passportal 之外的任何地方。
 - 容器以非 root 用户运行。
-- 切勿提交真实 token、API key 或 secret —— `.gitignore` 已排除 `.env`。
+- 切勿提交真实 Access Key / Secret Access Key —— `.gitignore` 已排除 `.env`。
